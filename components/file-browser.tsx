@@ -425,7 +425,7 @@ export default function FileBrowser({ userRole, organizationUuid }: FileBrowserP
                       <TabsContent value="large" className="mt-4">
                         <div className="text-sm text-gray-500 mb-4">
                           Use esta opción para subir archivos de gran tamaño (hasta varios GB). El archivo se divide en
-                          partes pequeñas y se sube a través del servidor para evitar problemas de CORS.
+                          partes de 5MB y se sube a través del servidor para evitar problemas de CORS.
                         </div>
                         <LargeFileUpload
                           prefix={currentPath ? `${organizationUuid}/${currentPath}` : `${organizationUuid}/`}

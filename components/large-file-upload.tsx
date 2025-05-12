@@ -10,8 +10,8 @@ import { Upload, X, FileUp, AlertCircle } from "lucide-react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { FileIcon as CustomFileIcon } from "./file-preview"
 
-// Tamaño de cada parte en bytes (2MB para estar por debajo del límite de Vercel)
-const CHUNK_SIZE = 2 * 1024 * 1024
+// Tamaño de cada parte en bytes (5MB mínimo requerido por S3 para cargas multiparte)
+const CHUNK_SIZE = 5 * 1024 * 1024
 
 // Número máximo de cargas paralelas
 const MAX_CONCURRENT_UPLOADS = 3
@@ -105,7 +105,8 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
       })
 
       if (!response.ok) {
-        throw new Error(`Error al subir parte ${partNumber}`)
+        const errorData = await response.json()
+        throw new Error(errorData.error || `Error al subir parte ${partNumber}`)
       }
 
       const data = await response.json()
