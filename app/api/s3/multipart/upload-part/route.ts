@@ -85,7 +85,7 @@ export async function POST(request: Request) {
 
       return NextResponse.json({
         success: true,
-        etag: response.ETag,
+        etag: response.ETag?.replace(/"/g, ""), // Eliminar comillas del ETag
         partNumber,
       })
     } catch (s3Error: any) {

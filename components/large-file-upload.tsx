@@ -6,9 +6,11 @@ import { useState, useRef, useCallback } from "react"
 import { useToast } from "@/hooks/use-toast"
 import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
-import { Upload, X, FileUp, AlertCircle } from "lucide-react"
+import { Upload, X, FileUp, AlertCircle, Settings } from "lucide-react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { FileIcon as CustomFileIcon } from "./file-preview"
+import { Switch } from "@/components/ui/switch"
+import { Label } from "@/components/ui/label"
 
 // Tamaño de cada parte en bytes (5MB mínimo requerido por S3 para cargas multiparte)
 const CHUNK_SIZE = 5 * 1024 * 1024
@@ -36,6 +38,8 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
   const abortControllerRef = useRef<AbortController | null>(null)
   const [uploadId, setUploadId] = useState<string | null>(null)
   const [key, setKey] = useState<string | null>(null)
+  const [useServerProxy, setUseServerProxy] = useState<boolean>(true)
+  const [showAdvanced, setShowAdvanced] = useState<boolean>(false)
 
   // Referencias para calcular velocidad y tiempo restante
   const startTimeRef = useRef<number>(0)
@@ -82,6 +86,49 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
     setProgress(newProgress)
   }, [])
 
+  // Función para subir una parte a través del servidor (evita CORS)
+  const uploadPartThroughServer = async (
+    chunk: Blob,
+    key: string,
+    uploadId: string,
+    partNumber: number,
+    signal: AbortSignal,
+  ): Promise<{ etag: string; partNumber: number }> => {
+    try {
+      // Crear FormData para enviar la parte
+      const formData = new FormData()
+      formData.append("file", chunk)
+      formData.append("key", key)
+      formData.append("uploadId", uploadId)
+      formData.append("partNumber", partNumber.toString())
+
+      // Subir la parte a través del servidor
+      const response = await fetch("/api/s3/multipart/upload-part", {
+        method: "POST",
+        body: formData,
+        signal,
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json()
+        throw new Error(errorData.error || `Error al subir parte ${partNumber}`)
+      }
+
+      const data = await response.json()
+
+      // Actualizar progreso
+      updateProgress(chunk.size)
+
+      return {
+        etag: data.etag,
+        partNumber: partNumber,
+      }
+    } catch (error) {
+      console.error(`Error al subir parte ${partNumber} a través del servidor:`, error)
+      throw error
+    }
+  }
+
   // Función para subir una parte directamente a S3 usando URL presignada
   const uploadPartDirectlyToS3 = async (
     chunk: Blob,
@@ -97,6 +144,7 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
         signal,
         headers: {
           "Content-Length": chunk.size.toString(),
+          "Content-Type": "application/octet-stream",
         },
       })
 
@@ -121,7 +169,7 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
         partNumber: partNumber,
       }
     } catch (error) {
-      console.error(`Error al subir parte ${partNumber}:`, error)
+      console.error(`Error al subir parte ${partNumber} directamente a S3:`, error)
       throw error
     }
   }
@@ -206,18 +254,31 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
             const end = Math.min(partNumber * CHUNK_SIZE, selectedFile.size)
             const chunk = selectedFile.slice(start, end)
 
-            // Obtener URL presignada y subir directamente a S3
-            uploadPromises.push(
-              getPresignedUrlForPart(newKey, newUploadId, partNumber, signal)
-                .then((signedUrl) => uploadPartDirectlyToS3(chunk, signedUrl, partNumber, signal))
-                .then((result) => {
+            if (useServerProxy) {
+              // Usar el servidor como proxy para evitar CORS
+              uploadPromises.push(
+                uploadPartThroughServer(chunk, newKey, newUploadId, partNumber, signal).then((result) => {
                   parts.push({
                     PartNumber: result.partNumber,
                     ETag: result.etag,
                   })
                   return result
                 }),
-            )
+              )
+            } else {
+              // Obtener URL presignada y subir directamente a S3
+              uploadPromises.push(
+                getPresignedUrlForPart(newKey, newUploadId, partNumber, signal)
+                  .then((signedUrl) => uploadPartDirectlyToS3(chunk, signedUrl, partNumber, signal))
+                  .then((result) => {
+                    parts.push({
+                      PartNumber: result.partNumber,
+                      ETag: result.etag,
+                    })
+                    return result
+                  }),
+              )
+            }
           }
         }
 
@@ -350,6 +411,39 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
               <X className="h-4 w-4" />
             </Button>
           </div>
+
+          {!isUploading && (
+            <div className="mb-4">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-xs text-gray-500 flex items-center"
+                onClick={() => setShowAdvanced(!showAdvanced)}
+              >
+                <Settings className="h-3 w-3 mr-1" />
+                {showAdvanced ? "Ocultar opciones avanzadas" : "Mostrar opciones avanzadas"}
+              </Button>
+
+              {showAdvanced && (
+                <div className="mt-2 p-3 bg-gray-50 rounded-md">
+                  <div className="flex items-center space-x-2">
+                    <Switch
+                      id="server-proxy"
+                      checked={useServerProxy}
+                      onCheckedChange={setUseServerProxy}
+                      disabled={isUploading}
+                    />
+                    <Label htmlFor="server-proxy">Usar servidor como proxy (evita problemas de CORS)</Label>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1 ml-7">
+                    {useServerProxy
+                      ? "Las partes se envían a través del servidor para evitar problemas de CORS. Puede ser más lento pero más confiable."
+                      : "Las partes se envían directamente a S3. Es más rápido pero puede tener problemas de CORS si S3 no está correctamente configurado."}
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
 
           {isUploading ? (
             <div className="space-y-2">
