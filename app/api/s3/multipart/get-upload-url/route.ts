@@ -46,10 +46,25 @@ export async function POST(request: Request) {
     // Generar URL presignada con una duración más larga (1 hora)
     const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 })
 
-    return NextResponse.json({
-      signedUrl,
-      partNumber,
-    })
+    // Devolver la URL con información CORS
+    return NextResponse.json(
+      {
+        signedUrl,
+        partNumber,
+        corsHeaders: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "PUT,POST,GET",
+          "Access-Control-Allow-Headers": "Content-Type,Content-Length,Authorization,x-amz-date,x-amz-content-sha256",
+        },
+      },
+      {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        },
+      },
+    )
   } catch (error) {
     console.error("Error generando URL para parte:", error)
     return NextResponse.json({ error: "Error al generar URL para parte" }, { status: 500 })

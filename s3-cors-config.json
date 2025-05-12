@@ -8,7 +8,10 @@
       "Content-MD5",
       "x-amz-date",
       "x-amz-content-sha256",
-      "x-amz-user-agent"
+      "x-amz-user-agent",
+      "Origin",
+      "Access-Control-Request-Method",
+      "Access-Control-Request-Headers"
     ],
     "AllowedMethods": ["GET", "PUT", "POST", "DELETE", "HEAD"],
     "AllowedOrigins": ["*"],
