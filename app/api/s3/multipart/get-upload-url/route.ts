@@ -43,8 +43,8 @@ export async function POST(request: Request) {
       PartNumber: partNumber,
     })
 
-    // Generar URL presignada
-    const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 }) // 1 hora
+    // Generar URL presignada con una duración más larga (1 hora)
+    const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 })
 
     return NextResponse.json({
       signedUrl,

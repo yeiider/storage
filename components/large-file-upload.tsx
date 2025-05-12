@@ -82,44 +82,77 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
     setProgress(newProgress)
   }, [])
 
-  const uploadPartThroughServer = async (
+  // Función para subir una parte directamente a S3 usando URL presignada
+  const uploadPartDirectlyToS3 = async (
     chunk: Blob,
-    key: string,
-    uploadId: string,
+    signedUrl: string,
     partNumber: number,
     signal: AbortSignal,
   ): Promise<{ etag: string; partNumber: number }> => {
     try {
-      // Crear FormData para enviar la parte
-      const formData = new FormData()
-      formData.append("file", chunk)
-      formData.append("key", key)
-      formData.append("uploadId", uploadId)
-      formData.append("partNumber", partNumber.toString())
-
-      // Subir la parte a través del servidor
-      const response = await fetch("/api/s3/multipart/upload-part", {
-        method: "POST",
-        body: formData,
+      // Subir la parte directamente a S3 usando la URL presignada
+      const response = await fetch(signedUrl, {
+        method: "PUT",
+        body: chunk,
         signal,
+        headers: {
+          "Content-Length": chunk.size.toString(),
+        },
       })
 
       if (!response.ok) {
-        const errorData = await response.json()
-        throw new Error(errorData.error || `Error al subir parte ${partNumber}`)
+        throw new Error(`Error al subir parte ${partNumber}: ${response.statusText}`)
       }
 
-      const data = await response.json()
+      // S3 devuelve el ETag en el header
+      const etag = response.headers.get("ETag")
+      if (!etag) {
+        throw new Error(`No se recibió ETag para la parte ${partNumber}`)
+      }
 
       // Actualizar progreso
       updateProgress(chunk.size)
 
+      // Limpiar comillas del ETag si las tiene
+      const cleanEtag = etag.replace(/"/g, "")
+
       return {
-        etag: data.etag,
+        etag: cleanEtag,
         partNumber: partNumber,
       }
     } catch (error) {
       console.error(`Error al subir parte ${partNumber}:`, error)
+      throw error
+    }
+  }
+
+  // Función para obtener URL presignada para una parte
+  const getPresignedUrlForPart = async (
+    key: string,
+    uploadId: string,
+    partNumber: number,
+    signal: AbortSignal,
+  ): Promise<string> => {
+    try {
+      const response = await fetch("/api/s3/multipart/get-upload-url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          key,
+          uploadId,
+          partNumber,
+        }),
+        signal,
+      })
+
+      if (!response.ok) {
+        throw new Error(`Error al obtener URL para parte ${partNumber}`)
+      }
+
+      const data = await response.json()
+      return data.signedUrl
+    } catch (error) {
+      console.error(`Error al obtener URL para parte ${partNumber}:`, error)
       throw error
     }
   }
@@ -173,14 +206,17 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
             const end = Math.min(partNumber * CHUNK_SIZE, selectedFile.size)
             const chunk = selectedFile.slice(start, end)
 
+            // Obtener URL presignada y subir directamente a S3
             uploadPromises.push(
-              uploadPartThroughServer(chunk, newKey, newUploadId, partNumber, signal).then((result) => {
-                parts.push({
-                  PartNumber: result.partNumber,
-                  ETag: result.etag,
-                })
-                return result
-              }),
+              getPresignedUrlForPart(newKey, newUploadId, partNumber, signal)
+                .then((signedUrl) => uploadPartDirectlyToS3(chunk, signedUrl, partNumber, signal))
+                .then((result) => {
+                  parts.push({
+                    PartNumber: result.partNumber,
+                    ETag: result.etag,
+                  })
+                  return result
+                }),
             )
           }
         }
