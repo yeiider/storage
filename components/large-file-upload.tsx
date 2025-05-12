@@ -1,7 +1,5 @@
 "use client"
 
-import { useEffect } from "react"
-
 import type React from "react"
 
 import { useState, useRef, useCallback } from "react"
@@ -11,14 +9,9 @@ import { Progress } from "@/components/ui/progress"
 import { Upload, X, FileUp, AlertCircle, Settings } from "lucide-react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { FileIcon as CustomFileIcon } from "./file-preview"
-import { Switch } from "@/components/ui/switch"
-import { Label } from "@/components/ui/label"
 
-// Tamaño de cada parte para carga directa a S3 (5MB mínimo requerido por S3)
-const S3_CHUNK_SIZE = 5 * 1024 * 1024
-
-// Tamaño de cada parte para carga a través del servidor (2MB para evitar límites de payload)
-const SERVER_CHUNK_SIZE = 2 * 1024 * 1024
+// Tamaño de cada parte para S3 (5MB mínimo requerido por S3)
+const CHUNK_SIZE = 5 * 1024 * 1024
 
 // Número máximo de cargas paralelas
 const MAX_CONCURRENT_UPLOADS = 3
@@ -43,7 +36,6 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
   const abortControllerRef = useRef<AbortController | null>(null)
   const [uploadId, setUploadId] = useState<string | null>(null)
   const [key, setKey] = useState<string | null>(null)
-  const [useServerProxy, setUseServerProxy] = useState<boolean>(true)
   const [showAdvanced, setShowAdvanced] = useState<boolean>(false)
 
   // Referencias para calcular velocidad y tiempo restante
@@ -57,22 +49,12 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
       setSelectedFile(file)
       setErrorMessage("")
 
-      // Calcular número total de partes según el método de carga
-      const chunkSize = useServerProxy ? SERVER_CHUNK_SIZE : S3_CHUNK_SIZE
-      const chunks = Math.ceil(file.size / chunkSize)
+      // Calcular número total de partes
+      const chunks = Math.ceil(file.size / CHUNK_SIZE)
       setTotalChunks(chunks)
       totalBytesRef.current = file.size
     }
   }
-
-  // Recalcular el número total de partes cuando cambia el método de carga
-  useEffect(() => {
-    if (selectedFile) {
-      const chunkSize = useServerProxy ? SERVER_CHUNK_SIZE : S3_CHUNK_SIZE
-      const chunks = Math.ceil(selectedFile.size / chunkSize)
-      setTotalChunks(chunks)
-    }
-  }, [useServerProxy, selectedFile])
 
   const updateProgress = useCallback((chunkSize: number) => {
     uploadedBytesRef.current += chunkSize
@@ -100,49 +82,6 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
     const newProgress = Math.round((uploadedBytesRef.current / totalBytesRef.current) * 100)
     setProgress(newProgress)
   }, [])
-
-  // Función para subir una parte a través del servidor (evita CORS)
-  const uploadPartThroughServer = async (
-    chunk: Blob,
-    key: string,
-    uploadId: string,
-    partNumber: number,
-    signal: AbortSignal,
-  ): Promise<{ etag: string; partNumber: number }> => {
-    try {
-      // Crear FormData para enviar la parte
-      const formData = new FormData()
-      formData.append("file", chunk)
-      formData.append("key", key)
-      formData.append("uploadId", uploadId)
-      formData.append("partNumber", partNumber.toString())
-
-      // Subir la parte a través del servidor
-      const response = await fetch("/api/s3/multipart/upload-part", {
-        method: "POST",
-        body: formData,
-        signal,
-      })
-
-      if (!response.ok) {
-        const errorData = await response.json()
-        throw new Error(errorData.error || `Error al subir parte ${partNumber}`)
-      }
-
-      const data = await response.json()
-
-      // Actualizar progreso
-      updateProgress(chunk.size)
-
-      return {
-        etag: data.etag,
-        partNumber: partNumber,
-      }
-    } catch (error) {
-      console.error(`Error al subir parte ${partNumber} a través del servidor:`, error)
-      throw error
-    }
-  }
 
   // Función para subir una parte directamente a S3 usando URL presignada
   const uploadPartDirectlyToS3 = async (
@@ -254,9 +193,8 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
       const { uploadId: newUploadId } = await initResponse.json()
       setUploadId(newUploadId)
 
-      // 2. Dividir el archivo en partes (tamaño según método de carga)
-      const chunkSize = useServerProxy ? SERVER_CHUNK_SIZE : S3_CHUNK_SIZE
-      const totalParts = Math.ceil(selectedFile.size / chunkSize)
+      // 2. Dividir el archivo en partes de 5MB (requisito de S3)
+      const totalParts = Math.ceil(selectedFile.size / CHUNK_SIZE)
       const parts: { PartNumber: number; ETag: string }[] = []
 
       // Función para procesar un lote de partes en paralelo
@@ -266,35 +204,22 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
         for (let i = 0; i < MAX_CONCURRENT_UPLOADS && startIdx + i <= totalParts; i++) {
           const partNumber = startIdx + i
           if (partNumber <= totalParts) {
-            const start = (partNumber - 1) * chunkSize
-            const end = Math.min(partNumber * chunkSize, selectedFile.size)
+            const start = (partNumber - 1) * CHUNK_SIZE
+            const end = Math.min(partNumber * CHUNK_SIZE, selectedFile.size)
             const chunk = selectedFile.slice(start, end)
 
-            if (useServerProxy) {
-              // Usar el servidor como proxy para evitar CORS
-              uploadPromises.push(
-                uploadPartThroughServer(chunk, newKey, newUploadId, partNumber, signal).then((result) => {
+            // Obtener URL presignada y subir directamente a S3
+            uploadPromises.push(
+              getPresignedUrlForPart(newKey, newUploadId, partNumber, signal)
+                .then((signedUrl) => uploadPartDirectlyToS3(chunk, signedUrl, partNumber, signal))
+                .then((result) => {
                   parts.push({
                     PartNumber: result.partNumber,
                     ETag: result.etag,
                   })
                   return result
                 }),
-              )
-            } else {
-              // Obtener URL presignada y subir directamente a S3
-              uploadPromises.push(
-                getPresignedUrlForPart(newKey, newUploadId, partNumber, signal)
-                  .then((signedUrl) => uploadPartDirectlyToS3(chunk, signedUrl, partNumber, signal))
-                  .then((result) => {
-                    parts.push({
-                      PartNumber: result.partNumber,
-                      ETag: result.etag,
-                    })
-                    return result
-                  }),
-              )
-            }
+            )
           }
         }
 
@@ -437,24 +362,23 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
                 onClick={() => setShowAdvanced(!showAdvanced)}
               >
                 <Settings className="h-3 w-3 mr-1" />
-                {showAdvanced ? "Ocultar opciones avanzadas" : "Mostrar opciones avanzadas"}
+                {showAdvanced ? "Ocultar información técnica" : "Mostrar información técnica"}
               </Button>
 
               {showAdvanced && (
                 <div className="mt-2 p-3 bg-gray-50 rounded-md">
-                  <div className="flex items-center space-x-2">
-                    <Switch
-                      id="server-proxy"
-                      checked={useServerProxy}
-                      onCheckedChange={setUseServerProxy}
-                      disabled={isUploading}
-                    />
-                    <Label htmlFor="server-proxy">Usar servidor como proxy (evita problemas de CORS)</Label>
-                  </div>
-                  <p className="text-xs text-gray-500 mt-1 ml-7">
-                    {useServerProxy
-                      ? "Las partes se envían a través del servidor en fragmentos de 2MB para evitar problemas de límites de carga. Puede ser más lento pero más confiable."
-                      : "Las partes se envían directamente a S3 en fragmentos de 5MB. Es más rápido pero puede tener problemas de CORS si S3 no está correctamente configurado."}
+                  <p className="text-xs text-gray-700 mb-2">
+                    <strong>Método de carga:</strong> URLs presignadas directas a S3
+                  </p>
+                  <p className="text-xs text-gray-700 mb-2">
+                    <strong>Tamaño de cada parte:</strong> 5MB (mínimo requerido por S3)
+                  </p>
+                  <p className="text-xs text-gray-700 mb-2">
+                    <strong>Cargas paralelas:</strong> {MAX_CONCURRENT_UPLOADS} partes simultáneas
+                  </p>
+                  <p className="text-xs text-gray-500 mt-2">
+                    Este método utiliza URLs presignadas para subir directamente a S3, lo que proporciona mejor
+                    rendimiento. Cada parte debe ser de al menos 5MB según los requisitos de S3.
                   </p>
                 </div>
               )}
