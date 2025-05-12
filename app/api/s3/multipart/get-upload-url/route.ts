@@ -15,24 +15,67 @@ const s3Client = new S3Client({
 
 const bucketName = process.env.AWS_BUCKET_NAME || ""
 
+// Manejar solicitudes OPTIONS para CORS preflight
+export async function OPTIONS(request: Request) {
+  return new NextResponse(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Max-Age": "86400", // 24 horas
+    },
+  })
+}
+
 export async function POST(request: Request) {
   try {
     // Check authentication
     const session = await getServerSession(authOptions)
     if (!session) {
-      return NextResponse.json({ error: "No autorizado" }, { status: 401 })
+      return NextResponse.json(
+        { error: "No autorizado" },
+        {
+          status: 401,
+          headers: {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          },
+        },
+      )
     }
 
     // Check write permission
     if (session.user.role !== "write" && session.user.role !== "superadmin" && session.user.role !== "owner") {
-      return NextResponse.json({ error: "Permisos insuficientes" }, { status: 403 })
+      return NextResponse.json(
+        { error: "Permisos insuficientes" },
+        {
+          status: 403,
+          headers: {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          },
+        },
+      )
     }
 
     // Get request body
     const { key, uploadId, partNumber } = await request.json()
 
     if (!key || !uploadId || !partNumber) {
-      return NextResponse.json({ error: "Información de parte incompleta" }, { status: 400 })
+      return NextResponse.json(
+        { error: "Información de parte incompleta" },
+        {
+          status: 400,
+          headers: {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          },
+        },
+      )
     }
 
     // Crear comando para subir parte
@@ -51,11 +94,6 @@ export async function POST(request: Request) {
       {
         signedUrl,
         partNumber,
-        corsHeaders: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "PUT,POST,GET",
-          "Access-Control-Allow-Headers": "Content-Type,Content-Length,Authorization,x-amz-date,x-amz-content-sha256",
-        },
       },
       {
         headers: {
@@ -67,6 +105,16 @@ export async function POST(request: Request) {
     )
   } catch (error) {
     console.error("Error generando URL para parte:", error)
-    return NextResponse.json({ error: "Error al generar URL para parte" }, { status: 500 })
+    return NextResponse.json(
+      { error: "Error al generar URL para parte" },
+      {
+        status: 500,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        },
+      },
+    )
   }
 }

@@ -89,28 +89,29 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
     uploadId: string,
     partNumber: number,
     signal: AbortSignal,
-  ): Promise<{ signedUrl: string; corsHeaders: Record<string, string> }> => {
+  ): Promise<string> => {
     try {
       const response = await fetch("/api/s3/multipart/get-upload-url", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Origin: window.location.origin,
+        },
         body: JSON.stringify({
           key,
           uploadId,
           partNumber,
         }),
         signal,
+        credentials: "same-origin",
       })
 
       if (!response.ok) {
-        throw new Error(`Error al obtener URL para parte ${partNumber}`)
+        throw new Error(`Error al obtener URL para parte ${partNumber}: ${response.statusText}`)
       }
 
       const data = await response.json()
-      return {
-        signedUrl: data.signedUrl,
-        corsHeaders: data.corsHeaders || {},
-      }
+      return data.signedUrl
     } catch (error) {
       console.error(`Error al obtener URL para parte ${partNumber}:`, error)
       throw error
@@ -120,13 +121,13 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
   // Función para subir una parte directamente a S3 usando URL presignada
   const uploadPartDirectlyToS3 = async (
     chunk: Blob,
-    urlData: { signedUrl: string; corsHeaders: Record<string, string> },
+    signedUrl: string,
     partNumber: number,
     signal: AbortSignal,
   ): Promise<{ etag: string; partNumber: number }> => {
     try {
       // Subir la parte directamente a S3 usando la URL presignada
-      const response = await fetch(urlData.signedUrl, {
+      const response = await fetch(signedUrl, {
         method: "PUT",
         body: chunk,
         signal,
@@ -134,13 +135,12 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
           "Content-Length": chunk.size.toString(),
           "Content-Type": "application/octet-stream",
           Origin: window.location.origin,
-          ...urlData.corsHeaders,
         },
-        mode: "cors",
       })
 
       if (!response.ok) {
-        throw new Error(`Error al subir parte ${partNumber}: ${response.statusText}`)
+        const errorText = await response.text().catch(() => "Error desconocido")
+        throw new Error(`Error al subir parte ${partNumber}: ${response.statusText} - ${errorText}`)
       }
 
       // S3 devuelve el ETag en el header
@@ -165,42 +165,6 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
     }
   }
 
-  // Función para procesar un lote de partes en paralelo
-  const processChunkBatch = async (
-    startIdx: number,
-    newKey: string,
-    newUploadId: string,
-    signal: AbortSignal,
-    totalParts: number,
-    parts: { PartNumber: number; ETag: string }[],
-  ) => {
-    const uploadPromises = []
-
-    for (let i = 0; i < MAX_CONCURRENT_UPLOADS && startIdx + i <= totalParts; i++) {
-      const partNumber = startIdx + i
-      if (partNumber <= totalParts) {
-        const start = (partNumber - 1) * CHUNK_SIZE
-        const end = Math.min(partNumber * CHUNK_SIZE, selectedFile.size)
-        const chunk = selectedFile.slice(start, end)
-
-        // Obtener URL presignada y subir directamente a S3
-        uploadPromises.push(
-          getPresignedUrlForPart(newKey, newUploadId, partNumber, signal)
-            .then((urlData) => uploadPartDirectlyToS3(chunk, urlData, partNumber, signal))
-            .then((result) => {
-              parts.push({
-                PartNumber: result.partNumber,
-                ETag: result.etag,
-              })
-              return result
-            }),
-        )
-      }
-    }
-
-    await Promise.all(uploadPromises)
-  }
-
   const handleUpload = async () => {
     if (!selectedFile) return
 
@@ -220,16 +184,21 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
       setKey(newKey)
       const initResponse = await fetch("/api/s3/multipart/init", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Origin: window.location.origin,
+        },
         body: JSON.stringify({
           key: newKey,
           contentType: selectedFile.type,
         }),
         signal,
+        credentials: "same-origin",
       })
 
       if (!initResponse.ok) {
-        throw new Error("Error al iniciar la carga multiparte")
+        const errorText = await initResponse.text().catch(() => "Error desconocido")
+        throw new Error(`Error al iniciar la carga multiparte: ${initResponse.statusText} - ${errorText}`)
       }
 
       const { uploadId: newUploadId } = await initResponse.json()
@@ -240,6 +209,33 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
       const parts: { PartNumber: number; ETag: string }[] = []
 
       // Función para procesar un lote de partes en paralelo
+      const processChunkBatch = async (startIdx: number) => {
+        const uploadPromises = []
+
+        for (let i = 0; i < MAX_CONCURRENT_UPLOADS && startIdx + i <= totalParts; i++) {
+          const partNumber = startIdx + i
+          if (partNumber <= totalParts) {
+            const start = (partNumber - 1) * CHUNK_SIZE
+            const end = Math.min(partNumber * CHUNK_SIZE, selectedFile.size)
+            const chunk = selectedFile.slice(start, end)
+
+            // Obtener URL presignada y subir directamente a S3
+            uploadPromises.push(
+              getPresignedUrlForPart(newKey, newUploadId, partNumber, signal)
+                .then((signedUrl) => uploadPartDirectlyToS3(chunk, signedUrl, partNumber, signal))
+                .then((result) => {
+                  parts.push({
+                    PartNumber: result.partNumber,
+                    ETag: result.etag,
+                  })
+                  return result
+                }),
+            )
+          }
+        }
+
+        await Promise.all(uploadPromises)
+      }
 
       // Procesar todas las partes en lotes
       for (let batchStart = 1; batchStart <= totalParts; batchStart += MAX_CONCURRENT_UPLOADS) {
@@ -247,7 +243,7 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
           throw new Error("Carga cancelada por el usuario")
         }
 
-        await processChunkBatch(batchStart, newKey, newUploadId, signal, totalParts, parts)
+        await processChunkBatch(batchStart)
       }
 
       if (signal.aborted) {
@@ -259,17 +255,22 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
 
       const completeResponse = await fetch("/api/s3/multipart/complete", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Origin: window.location.origin,
+        },
         body: JSON.stringify({
           key: newKey,
           uploadId: newUploadId,
           parts: sortedParts,
         }),
         signal,
+        credentials: "same-origin",
       })
 
       if (!completeResponse.ok) {
-        throw new Error("Error al completar la carga multiparte")
+        const errorText = await completeResponse.text().catch(() => "Error desconocido")
+        throw new Error(`Error al completar la carga multiparte: ${completeResponse.statusText} - ${errorText}`)
       }
 
       toast({
@@ -287,11 +288,15 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
         if (uploadId && key) {
           await fetch("/api/s3/multipart/abort", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              Origin: window.location.origin,
+            },
             body: JSON.stringify({
               key: key,
               uploadId: uploadId,
             }),
+            credentials: "same-origin",
           })
         }
       } catch (abortError) {
