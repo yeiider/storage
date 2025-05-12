@@ -425,8 +425,8 @@ export default function FileBrowser({ userRole, organizationUuid }: FileBrowserP
                       <TabsContent value="large" className="mt-4">
                         <div className="text-sm text-gray-500 mb-4">
                           Use esta opción para subir archivos de gran tamaño (hasta varios GB). El archivo se divide en
-                          partes de 5MB y se puede subir a través del servidor o directamente a S3 (configurable en
-                          opciones avanzadas).
+                          partes más pequeñas (2MB cuando se usa el servidor, 5MB cuando es directo a S3) y se sube de
+                          forma eficiente respetando los límites de la plataforma.
                         </div>
                         <LargeFileUpload
                           prefix={currentPath ? `${organizationUuid}/${currentPath}` : `${organizationUuid}/`}

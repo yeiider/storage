@@ -38,13 +38,6 @@ async function parseMultipartForm(request: Request) {
 
   const buffer = Buffer.from(await file.arrayBuffer())
 
-  // Verificar que el tamaño del buffer sea al menos 5MB (excepto posiblemente la última parte)
-  if (buffer.length < 5 * 1024 * 1024) {
-    console.warn(
-      `Advertencia: Parte ${partNumber} tiene tamaño ${buffer.length} bytes, que es menor que el mínimo recomendado de 5MB`,
-    )
-  }
-
   return {
     buffer,
     uploadId,

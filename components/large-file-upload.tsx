@@ -1,5 +1,7 @@
 "use client"
 
+import { useEffect } from "react"
+
 import type React from "react"
 
 import { useState, useRef, useCallback } from "react"
@@ -12,8 +14,11 @@ import { FileIcon as CustomFileIcon } from "./file-preview"
 import { Switch } from "@/components/ui/switch"
 import { Label } from "@/components/ui/label"
 
-// Tamaño de cada parte en bytes (5MB mínimo requerido por S3 para cargas multiparte)
-const CHUNK_SIZE = 5 * 1024 * 1024
+// Tamaño de cada parte para carga directa a S3 (5MB mínimo requerido por S3)
+const S3_CHUNK_SIZE = 5 * 1024 * 1024
+
+// Tamaño de cada parte para carga a través del servidor (2MB para evitar límites de payload)
+const SERVER_CHUNK_SIZE = 2 * 1024 * 1024
 
 // Número máximo de cargas paralelas
 const MAX_CONCURRENT_UPLOADS = 3
@@ -52,12 +57,22 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
       setSelectedFile(file)
       setErrorMessage("")
 
-      // Calcular número total de partes
-      const chunks = Math.ceil(file.size / CHUNK_SIZE)
+      // Calcular número total de partes según el método de carga
+      const chunkSize = useServerProxy ? SERVER_CHUNK_SIZE : S3_CHUNK_SIZE
+      const chunks = Math.ceil(file.size / chunkSize)
       setTotalChunks(chunks)
       totalBytesRef.current = file.size
     }
   }
+
+  // Recalcular el número total de partes cuando cambia el método de carga
+  useEffect(() => {
+    if (selectedFile) {
+      const chunkSize = useServerProxy ? SERVER_CHUNK_SIZE : S3_CHUNK_SIZE
+      const chunks = Math.ceil(selectedFile.size / chunkSize)
+      setTotalChunks(chunks)
+    }
+  }, [useServerProxy, selectedFile])
 
   const updateProgress = useCallback((chunkSize: number) => {
     uploadedBytesRef.current += chunkSize
@@ -239,8 +254,9 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
       const { uploadId: newUploadId } = await initResponse.json()
       setUploadId(newUploadId)
 
-      // 2. Dividir el archivo en partes
-      const totalParts = Math.ceil(selectedFile.size / CHUNK_SIZE)
+      // 2. Dividir el archivo en partes (tamaño según método de carga)
+      const chunkSize = useServerProxy ? SERVER_CHUNK_SIZE : S3_CHUNK_SIZE
+      const totalParts = Math.ceil(selectedFile.size / chunkSize)
       const parts: { PartNumber: number; ETag: string }[] = []
 
       // Función para procesar un lote de partes en paralelo
@@ -250,8 +266,8 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
         for (let i = 0; i < MAX_CONCURRENT_UPLOADS && startIdx + i <= totalParts; i++) {
           const partNumber = startIdx + i
           if (partNumber <= totalParts) {
-            const start = (partNumber - 1) * CHUNK_SIZE
-            const end = Math.min(partNumber * CHUNK_SIZE, selectedFile.size)
+            const start = (partNumber - 1) * chunkSize
+            const end = Math.min(partNumber * chunkSize, selectedFile.size)
             const chunk = selectedFile.slice(start, end)
 
             if (useServerProxy) {
@@ -437,8 +453,8 @@ export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFi
                   </div>
                   <p className="text-xs text-gray-500 mt-1 ml-7">
                     {useServerProxy
-                      ? "Las partes se envían a través del servidor para evitar problemas de CORS. Puede ser más lento pero más confiable."
-                      : "Las partes se envían directamente a S3. Es más rápido pero puede tener problemas de CORS si S3 no está correctamente configurado."}
+                      ? "Las partes se envían a través del servidor en fragmentos de 2MB para evitar problemas de límites de carga. Puede ser más lento pero más confiable."
+                      : "Las partes se envían directamente a S3 en fragmentos de 5MB. Es más rápido pero puede tener problemas de CORS si S3 no está correctamente configurado."}
                   </p>
                 </div>
               )}
