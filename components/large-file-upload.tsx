@@ -1,0 +1,355 @@
+"use client"
+
+import type React from "react"
+
+import { useState, useRef, useCallback } from "react"
+import { useToast } from "@/hooks/use-toast"
+import { Button } from "@/components/ui/button"
+import { Progress } from "@/components/ui/progress"
+import { Upload, X, FileUp, AlertCircle } from "lucide-react"
+import { Alert, AlertDescription } from "@/components/ui/alert"
+import { FileIcon as CustomFileIcon } from "./file-preview"
+
+// Tamaño de cada parte en bytes (2MB para estar por debajo del límite de Vercel)
+const CHUNK_SIZE = 2 * 1024 * 1024
+
+// Número máximo de cargas paralelas
+const MAX_CONCURRENT_UPLOADS = 3
+
+interface LargeFileUploadProps {
+  prefix: string
+  onSuccess: () => void
+  onCancel: () => void
+}
+
+export default function LargeFileUpload({ prefix, onSuccess, onCancel }: LargeFileUploadProps) {
+  const { toast } = useToast()
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [isUploading, setIsUploading] = useState(false)
+  const [progress, setProgress] = useState(0)
+  const [uploadedChunks, setUploadedChunks] = useState(0)
+  const [totalChunks, setTotalChunks] = useState(0)
+  const [errorMessage, setErrorMessage] = useState("")
+  const [uploadSpeed, setUploadSpeed] = useState<string>("Calculando...")
+  const [timeRemaining, setTimeRemaining] = useState<string>("Calculando...")
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const abortControllerRef = useRef<AbortController | null>(null)
+  const [uploadId, setUploadId] = useState<string | null>(null)
+  const [key, setKey] = useState<string | null>(null)
+
+  // Referencias para calcular velocidad y tiempo restante
+  const startTimeRef = useRef<number>(0)
+  const uploadedBytesRef = useRef<number>(0)
+  const totalBytesRef = useRef<number>(0)
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      const file = e.target.files[0]
+      setSelectedFile(file)
+      setErrorMessage("")
+
+      // Calcular número total de partes
+      const chunks = Math.ceil(file.size / CHUNK_SIZE)
+      setTotalChunks(chunks)
+      totalBytesRef.current = file.size
+    }
+  }
+
+  const updateProgress = useCallback((chunkSize: number) => {
+    uploadedBytesRef.current += chunkSize
+    setUploadedChunks((prev) => prev + 1)
+
+    const elapsedSeconds = (Date.now() - startTimeRef.current) / 1000
+    if (elapsedSeconds > 0) {
+      // Calcular velocidad en MB/s
+      const speedMBps = uploadedBytesRef.current / elapsedSeconds / (1024 * 1024)
+      setUploadSpeed(`${speedMBps.toFixed(2)} MB/s`)
+
+      // Calcular tiempo restante
+      const remainingBytes = totalBytesRef.current - uploadedBytesRef.current
+      const remainingSeconds = remainingBytes / (uploadedBytesRef.current / elapsedSeconds)
+
+      if (remainingSeconds < 60) {
+        setTimeRemaining(`${Math.ceil(remainingSeconds)} segundos`)
+      } else if (remainingSeconds < 3600) {
+        setTimeRemaining(`${Math.ceil(remainingSeconds / 60)} minutos`)
+      } else {
+        setTimeRemaining(`${(remainingSeconds / 3600).toFixed(1)} horas`)
+      }
+    }
+
+    const newProgress = Math.round((uploadedBytesRef.current / totalBytesRef.current) * 100)
+    setProgress(newProgress)
+  }, [])
+
+  const uploadPartThroughServer = async (
+    chunk: Blob,
+    key: string,
+    uploadId: string,
+    partNumber: number,
+    signal: AbortSignal,
+  ): Promise<{ etag: string; partNumber: number }> => {
+    try {
+      // Crear FormData para enviar la parte
+      const formData = new FormData()
+      formData.append("file", chunk)
+      formData.append("key", key)
+      formData.append("uploadId", uploadId)
+      formData.append("partNumber", partNumber.toString())
+
+      // Subir la parte a través del servidor
+      const response = await fetch("/api/s3/multipart/upload-part", {
+        method: "POST",
+        body: formData,
+        signal,
+      })
+
+      if (!response.ok) {
+        throw new Error(`Error al subir parte ${partNumber}`)
+      }
+
+      const data = await response.json()
+
+      // Actualizar progreso
+      updateProgress(chunk.size)
+
+      return {
+        etag: data.etag,
+        partNumber: partNumber,
+      }
+    } catch (error) {
+      console.error(`Error al subir parte ${partNumber}:`, error)
+      throw error
+    }
+  }
+
+  const handleUpload = async () => {
+    if (!selectedFile) return
+
+    try {
+      setIsUploading(true)
+      setProgress(0)
+      setUploadedChunks(0)
+      uploadedBytesRef.current = 0
+      startTimeRef.current = Date.now()
+
+      // Crear un nuevo AbortController para esta carga
+      abortControllerRef.current = new AbortController()
+      const signal = abortControllerRef.current.signal
+
+      // 1. Iniciar carga multiparte
+      const newKey = `${prefix}${selectedFile.name}`
+      setKey(newKey)
+      const initResponse = await fetch("/api/s3/multipart/init", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          key: newKey,
+          contentType: selectedFile.type,
+        }),
+        signal,
+      })
+
+      if (!initResponse.ok) {
+        throw new Error("Error al iniciar la carga multiparte")
+      }
+
+      const { uploadId: newUploadId } = await initResponse.json()
+      setUploadId(newUploadId)
+
+      // 2. Dividir el archivo en partes
+      const totalParts = Math.ceil(selectedFile.size / CHUNK_SIZE)
+      const parts: { PartNumber: number; ETag: string }[] = []
+
+      // Función para procesar un lote de partes en paralelo
+      const processChunkBatch = async (startIdx: number) => {
+        const uploadPromises = []
+
+        for (let i = 0; i < MAX_CONCURRENT_UPLOADS && startIdx + i <= totalParts; i++) {
+          const partNumber = startIdx + i
+          if (partNumber <= totalParts) {
+            const start = (partNumber - 1) * CHUNK_SIZE
+            const end = Math.min(partNumber * CHUNK_SIZE, selectedFile.size)
+            const chunk = selectedFile.slice(start, end)
+
+            uploadPromises.push(
+              uploadPartThroughServer(chunk, newKey, newUploadId, partNumber, signal).then((result) => {
+                parts.push({
+                  PartNumber: result.partNumber,
+                  ETag: result.etag,
+                })
+                return result
+              }),
+            )
+          }
+        }
+
+        await Promise.all(uploadPromises)
+      }
+
+      // Procesar todas las partes en lotes
+      for (let batchStart = 1; batchStart <= totalParts; batchStart += MAX_CONCURRENT_UPLOADS) {
+        if (signal.aborted) {
+          throw new Error("Carga cancelada por el usuario")
+        }
+
+        await processChunkBatch(batchStart)
+      }
+
+      if (signal.aborted) {
+        throw new Error("Carga cancelada por el usuario")
+      }
+
+      // 3. Completar la carga multiparte (ordenar las partes por número)
+      const sortedParts = [...parts].sort((a, b) => a.PartNumber - b.PartNumber)
+
+      const completeResponse = await fetch("/api/s3/multipart/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          key: newKey,
+          uploadId: newUploadId,
+          parts: sortedParts,
+        }),
+        signal,
+      })
+
+      if (!completeResponse.ok) {
+        throw new Error("Error al completar la carga multiparte")
+      }
+
+      toast({
+        title: "Archivo subido",
+        description: `${selectedFile.name} se ha subido correctamente`,
+      })
+
+      setSelectedFile(null)
+      onSuccess()
+    } catch (error) {
+      console.error("Error en carga multiparte:", error)
+
+      // Si hay un error, intentar abortar la carga multiparte
+      try {
+        if (uploadId && key) {
+          await fetch("/api/s3/multipart/abort", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              key: key,
+              uploadId: uploadId,
+            }),
+          })
+        }
+      } catch (abortError) {
+        console.error("Error al abortar carga multiparte:", abortError)
+      }
+
+      if (error instanceof Error) {
+        if (error.message === "Carga cancelada por el usuario") {
+          toast({
+            title: "Carga cancelada",
+            description: "La carga ha sido cancelada",
+          })
+        } else {
+          setErrorMessage(error.message)
+          toast({
+            variant: "destructive",
+            title: "Error",
+            description: error.message,
+          })
+        }
+      }
+    } finally {
+      setIsUploading(false)
+      abortControllerRef.current = null
+    }
+  }
+
+  const handleCancel = () => {
+    if (isUploading && abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    } else {
+      onCancel()
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      {errorMessage && (
+        <Alert variant="destructive">
+          <AlertCircle className="h-4 w-4" />
+          <AlertDescription>{errorMessage}</AlertDescription>
+        </Alert>
+      )}
+
+      {!selectedFile ? (
+        <div className="border-2 border-dashed rounded-lg p-8 transition-colors hover:border-primary/50">
+          <div className="flex flex-col items-center justify-center text-center cursor-pointer">
+            <Upload className="h-12 w-12 text-gray-400 mb-4" />
+            <h3 className="text-lg font-medium mb-2">Selecciona un archivo grande</h3>
+            <p className="text-sm text-gray-500 mb-4">Esta opción permite subir archivos de hasta varios GB</p>
+            <Button variant="outline" size="sm" onClick={() => fileInputRef.current?.click()}>
+              <FileUp className="h-4 w-4 mr-2" />
+              Seleccionar archivo
+            </Button>
+            <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
+          </div>
+        </div>
+      ) : (
+        <div className="border rounded-lg p-4">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center">
+              <div className="w-10 h-10 mr-3 flex items-center justify-center">
+                <CustomFileIcon extension={selectedFile.name.split(".").pop() || ""} size={40} />
+              </div>
+              <div>
+                <p className="font-medium">{selectedFile.name}</p>
+                <p className="text-xs text-gray-500">
+                  {formatFileSize(selectedFile.size)} • {totalChunks} partes
+                </p>
+              </div>
+            </div>
+            <Button variant="ghost" size="icon" onClick={() => setSelectedFile(null)} disabled={isUploading}>
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+
+          {isUploading ? (
+            <div className="space-y-2">
+              <div className="flex justify-between text-sm mb-1">
+                <span>
+                  Subiendo parte {uploadedChunks} de {totalChunks}
+                </span>
+                <span>{progress}%</span>
+              </div>
+              <Progress value={progress} className="h-2" />
+              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <span>Velocidad: {uploadSpeed}</span>
+                <span>Tiempo restante: {timeRemaining}</span>
+              </div>
+              <p className="text-xs text-center text-gray-500 mt-2">No cierre esta ventana durante la carga</p>
+            </div>
+          ) : (
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={handleCancel}>
+                Cancelar
+              </Button>
+              <Button onClick={handleUpload}>
+                <Upload className="h-4 w-4 mr-2" />
+                Iniciar carga
+              </Button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes === 0) return "0 Bytes"
+  const k = 1024
+  const sizes = ["Bytes", "KB", "MB", "GB", "TB"]
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return Number.parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i]
+}
